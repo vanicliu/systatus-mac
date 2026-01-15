@@ -7,7 +7,6 @@ CACHE_TS_FILE="/tmp/swiftbar_sysinfo_cache_ts.txt"
 SYSINFO_INTERVAL=5  # 秒
 NET_CACHE_FILE="/tmp/swiftbar_net_cache.txt"
 # 右侧列（Upload / VPN / CPU）起始列位置（字符列，基于等宽字体 Menlo）
-# 20 会让 Download/Upload 太挤，这里拉开到 28 列，让右列更像 iStat 风格。
 RIGHT_COL=28
 LEFT_MAX=$((RIGHT_COL - 1))
 
@@ -139,21 +138,6 @@ format_two_col() {
   /usr/bin/printf "%s%*s%s %s" "$left" "$pad" "" "$right_label" "$right_value"
 }
 
-# get_input_source() {
-#   /usr/bin/defaults read com.apple.HIToolbox AppleCurrentInputSource 2>/dev/null | /usr/bin/awk -F' = ' '
-#     /"KeyboardLayout Name"/ {
-#       name=$2; gsub(/^[ \t"]+/, "", name); gsub(/[;" \t]+$/, "", name);
-#     }
-#     /"Input Mode"/ {
-#       mode=$2; gsub(/^[ \t"]+/, "", mode); gsub(/[;" \t]+$/, "", mode);
-#     }
-#     END {
-#       if (mode != "") print mode;
-#       else if (name != "") print name;
-#     }
-#   '
-# }
-
 # ===== 网速（基于缓存的上次采样，避免 sleep）=====
 read -r rx_now tx_now <<<"$(read_bytes)"
 now_epoch=$(/bin/date +%s)
@@ -260,12 +244,6 @@ if [[ -n "$BATT_NUM" && "$BATT_NUM" -lt 30 ]]; then
 else
   echo "📊"
 fi
-# echo "◧◨"
-# BATT_PCT="$(get_battery_pct)"
-# INPUT_NAME="$(get_input_source)"
-# [[ -z "$BATT_PCT" ]] && BATT_PCT="--%"
-# [[ -z "$INPUT_NAME" ]] && INPUT_NAME="Unknown"
-# echo "电池: $BATT_PCT 输入法: $INPUT_NAME | image=$ICON_B64"
 
 # 下拉菜单：你想要的格式（网速+系统信息）
 # SwiftBar 菜单项样式：用等宽字体保证两列对齐（多空格不会被“视觉压缩”）
