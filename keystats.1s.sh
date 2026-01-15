@@ -2,10 +2,13 @@
 set -euo pipefail
 
 # ===== 配置 =====
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 CACHE_FILE="/tmp/swiftbar_sysinfo_cache.txt"
 CACHE_TS_FILE="/tmp/swiftbar_sysinfo_cache_ts.txt"
 SYSINFO_INTERVAL=5  # 秒
 NET_CACHE_FILE="/tmp/swiftbar_net_cache.txt"
+# 手动指定 vnstat 采样网卡（留空自动选择）
+VNSTAT_IFACE_OVERRIDE=""
 # 右侧列（Upload / VPN / CPU）起始列位置（字符列，基于等宽字体 Menlo）
 RIGHT_COL=28
 LEFT_MAX=$((RIGHT_COL - 1))
@@ -50,14 +53,99 @@ pick_iface() {
   echo "en0"
 }
 
+pick_physical_iface() {
+  local out=""
+  out=$(/usr/sbin/netstat -ibn 2>/dev/null | /usr/bin/awk '
+    $1 != "" {
+      iface=$1;
+      if (iface ~ /^lo0$/) next;
+      if (iface !~ /^en[0-9]+$/) next;
+      rx=$7+0; tx=$10+0; total=rx+tx;
+      if (total > max) {max=total; best=iface;}
+    }
+    END{if (best!="") print best}
+  ' || true)
+  if [[ -n "$out" ]]; then
+    echo "$out"
+    return
+  fi
+
+  echo "$IFACE"
+}
+
 IFACE=$(/sbin/route -n get default 2>/dev/null | /usr/bin/awk '/interface:/{print $2; exit}' || true)
 IFACE="$(pick_iface "$IFACE")"
+if [[ -n "$VNSTAT_IFACE_OVERRIDE" ]]; then
+  VNSTAT_IFACE="$VNSTAT_IFACE_OVERRIDE"
+else
+  VNSTAT_IFACE="$(pick_physical_iface)"
+fi
+
+read_bytes_nettop() {
+  local out="" rx=0 tx=0
+  out=$(/usr/bin/nettop -t external -L 1 -P -J bytes_in,bytes_out 2>/dev/null || true)
+  if [[ -z "$out" ]]; then
+    return 1
+  fi
+
+  read -r rx tx <<<"$(echo "$out" | /usr/bin/awk -F',' '
+    $2 == "bytes_in" { next }
+    $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ { in += $2; out += $3 }
+    END { print in+0, out+0 }
+  ')"
+
+  echo "${rx:-0} ${tx:-0}"
+}
+
+read_bytes_ifconfig() {
+  local iface="$1" rx="" tx=""
+  local out=""
+  out=$(/sbin/ifconfig "$iface" 2>/dev/null || true)
+  if [[ -n "$out" ]]; then
+    rx=$(echo "$out" | /usr/bin/awk '
+      /input packets/ {
+        for (i=1; i<=NF; i++) {
+          if ($i == "bytes") {
+            gsub(",", "", $(i+1));
+            print $(i+1);
+            exit;
+          }
+        }
+      }
+    ')
+    tx=$(echo "$out" | /usr/bin/awk '
+      /output packets/ {
+        for (i=1; i<=NF; i++) {
+          if ($i == "bytes") {
+            gsub(",", "", $(i+1));
+            print $(i+1);
+            exit;
+          }
+        }
+      }
+    ')
+  fi
+
+  echo "${rx:-0} ${tx:-0}"
+}
 
 read_bytes() {
   local netstat_out="" out="" rx=0 tx=0
+  out="$(read_bytes_nettop)" || out=""
+  if [[ -n "$out" ]]; then
+    read -r rx tx <<<"$out"
+    echo "${rx:-0} ${tx:-0}"
+    return
+  fi
+
   netstat_out=$(/usr/sbin/netstat -ibn 2>/dev/null || true)
-  if [[ -z "$netstat_out" || "$netstat_out" == Name* ]]; then
+  if [[ -z "$netstat_out" || "$netstat_out" == Name* || "$netstat_out" == netstat:* || "$netstat_out" == sudo:* || "$netstat_out" == *"Operation not permitted"* ]]; then
     netstat_out=$(/usr/bin/sudo -n /usr/sbin/netstat -ibn 2>/dev/null || true)
+  fi
+
+  if [[ -z "$netstat_out" || "$netstat_out" == Name* || "$netstat_out" == netstat:* || "$netstat_out" == sudo:* || "$netstat_out" == *"Operation not permitted"* ]]; then
+    read_bytes_ifconfig "$IFACE"
+    return
   fi
 
   if [[ -n "$netstat_out" ]]; then
@@ -69,6 +157,9 @@ read_bytes() {
     ')
     if [[ -n "$out" ]]; then
       read -r rx tx <<<"$out"
+    else
+      read_bytes_ifconfig "$IFACE"
+      return
     fi
 
     if (( rx + tx == 0 )); then
@@ -93,6 +184,24 @@ read_bytes() {
       fi
     fi
   fi
+
+  echo "${rx:-0} ${tx:-0}"
+}
+
+read_rate_vnstat() {
+  local iface="$1"
+  local out="" rx=0 tx=0
+
+  if ! command -v vnstat >/dev/null 2>&1; then
+    return 1
+  fi
+
+  out="$(vnstat -tr 2 -i "$iface" --json 2>/dev/null)" || return 1
+  if [[ -z "$out" ]]; then
+    return 1
+  fi
+
+  read -r rx tx <<<"$(/usr/bin/python3 -c 'import json,sys; data=json.load(sys.stdin); print("%d %d" % (int(data["rx"]["bytespersecond"]), int(data["tx"]["bytespersecond"])))' <<<"$out" 2>/dev/null)" || return 1
 
   echo "${rx:-0} ${tx:-0}"
 }
@@ -138,26 +247,40 @@ format_two_col() {
   /usr/bin/printf "%s%*s%s %s" "$left" "$pad" "" "$right_label" "$right_value"
 }
 
-# ===== 网速（基于缓存的上次采样，避免 sleep）=====
-read -r rx_now tx_now <<<"$(read_bytes)"
+# ===== 网速（优先 vnstat 实时采样；失败则用缓存差分）=====
 now_epoch=$(/bin/date +%s)
 
-rx_last=0
-tx_last=0
-ts_last=0
-if [[ -f "$NET_CACHE_FILE" ]]; then
-  read -r rx_last tx_last ts_last < "$NET_CACHE_FILE" || true
+RX=0
+TX=0
+rate_out=""
+if [[ -n "$VNSTAT_IFACE" && "$VNSTAT_IFACE" != "$IFACE" ]]; then
+  rate_out="$(read_rate_vnstat "$VNSTAT_IFACE" || true)"
 fi
-
-dt=$((now_epoch - ts_last))
-if (( dt <= 0 )); then
-  dt=1
+if [[ -z "$rate_out" ]]; then
+  rate_out="$(read_rate_vnstat "$IFACE" || true)"
 fi
+if [[ -n "$rate_out" ]]; then
+  read -r RX TX <<<"$rate_out"
+else
+  read -r rx_now tx_now <<<"$(read_bytes)"
 
-RX=$(((rx_now - rx_last) / dt)); ((RX<0)) && RX=0
-TX=$(((tx_now - tx_last) / dt)); ((TX<0)) && TX=0
+  rx_last=0
+  tx_last=0
+  ts_last=0
+  if [[ -f "$NET_CACHE_FILE" ]]; then
+    read -r rx_last tx_last ts_last < "$NET_CACHE_FILE" || true
+  fi
 
-echo "$rx_now $tx_now $now_epoch" > "$NET_CACHE_FILE"
+  dt=$((now_epoch - ts_last))
+  if (( dt <= 0 )); then
+    dt=1
+  fi
+
+  RX=$(((rx_now - rx_last) / dt)); ((RX<0)) && RX=0
+  TX=$(((tx_now - tx_last) / dt)); ((TX<0)) && TX=0
+
+  echo "$rx_now $tx_now $now_epoch" > "$NET_CACHE_FILE"
+fi
 
 RX_H="$(human_rate "$RX")"
 TX_H="$(human_rate "$TX")"
